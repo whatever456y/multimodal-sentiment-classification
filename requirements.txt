@@ -1,0 +1,12 @@
+torch
+torchvision
+transformers
+scikit-learn
+pandas
+numpy
+matplotlib
+tqdm
+Pillow
+modelscope
+
+
