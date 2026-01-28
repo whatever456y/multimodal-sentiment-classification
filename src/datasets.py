@@ -9,12 +9,13 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-
+# 情感标签映射
 LABEL2ID: Dict[str, int] = {"negative": 0, "neutral": 1, "positive": 2}
 ID2LABEL: Dict[int, str] = {v: k for k, v in LABEL2ID.items()}
 
 
 def _read_text_robust(path: Path) -> str:
+    # 读取文本文件，处理编码问题
     data = path.read_bytes()
     return data.decode("utf-8", errors="ignore").strip()
 
@@ -26,6 +27,7 @@ class Sample:
 
 
 def load_csv(path: str | Path) -> List[Tuple[str, str]]:
+    # 加载CSV格式的标注文件
     path = Path(path)
     rows: List[Tuple[str, str]] = []
     with path.open("r", encoding="utf-8") as f:
@@ -41,6 +43,18 @@ def load_csv(path: str | Path) -> List[Tuple[str, str]]:
 
 
 class MultiModalDataset(Dataset):
+    """多模态情感分析数据集
+    
+    支持同时加载文本和图像数据，每个样本包含：
+    - 文本文件 (.txt)
+    - 图像文件 (.jpg)
+    - 情感标签（训练/验证集）
+    
+    Attributes:
+        data_dir: 数据根目录，包含所有.txt和.jpg文件
+        samples: 样本列表，每个样本包含guid和label
+        image_transform: 图像预处理变换（如Resize、Normalize等）
+    """
     def __init__(
         self,
         data_dir: str | Path,

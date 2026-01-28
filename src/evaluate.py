@@ -19,6 +19,7 @@ from .utils import ensure_dir, get_text_model_path, save_json
 
 
 def plot_confusion_matrix(cm: np.ndarray, labels: List[str], save_path: Path) -> None:
+    # 绘制并保存混淆矩阵图像
     fig = plt.figure(figsize=(6, 5))
     plt.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
     plt.title("Confusion Matrix")
@@ -27,6 +28,7 @@ def plot_confusion_matrix(cm: np.ndarray, labels: List[str], save_path: Path) ->
     plt.xticks(tick_marks, labels, rotation=45)
     plt.yticks(tick_marks, labels)
 
+    # 动态计算阈值，用于决定文本颜色
     thresh = cm.max() / 2.0 if cm.max() > 0 else 0.5
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
@@ -41,6 +43,7 @@ def plot_confusion_matrix(cm: np.ndarray, labels: List[str], save_path: Path) ->
 
 @torch.no_grad()
 def evaluate(model, loader, device) -> Tuple[Dict[str, float], np.ndarray]:
+    # 评估模型在给定数据加载器上的表现
     model.eval()
     all_y: List[int] = []
     all_pred: List[int] = []
@@ -58,7 +61,9 @@ def evaluate(model, loader, device) -> Tuple[Dict[str, float], np.ndarray]:
         all_pred.extend(pred)
 
     acc = accuracy_score(all_y, all_pred)
+    # 计算宏平均精确率、召回率、F1分数
     precision, recall, f1, _ = precision_recall_fscore_support(all_y, all_pred, average="macro", zero_division=0)
+    # 生成混淆矩阵
     cm = confusion_matrix(all_y, all_pred, labels=[0, 1, 2])
 
     metrics = {
@@ -71,6 +76,7 @@ def evaluate(model, loader, device) -> Tuple[Dict[str, float], np.ndarray]:
 
 
 def collate_fn(tokenizer, batch, max_length: int):
+    # 数据加载器的批处理函数，处理文本编码和图像堆叠
     texts = [x["text"] for x in batch]
     images = torch.stack([x["image"] for x in batch])
     labels = torch.tensor([x["label"] for x in batch], dtype=torch.long)
@@ -92,6 +98,7 @@ def collate_fn(tokenizer, batch, max_length: int):
 
 
 def main() -> None:
+    """评估脚本主函数"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", type=str, default="project5")
     parser.add_argument("--ckpt", type=str, required=True)
@@ -117,18 +124,23 @@ def main() -> None:
 
     image_tf = transforms.Compose(
         [
-            transforms.Resize((224, 224)),
+            transforms.Resize((224, 224)),# 统一图像尺寸
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
     )
-
+    
+    # 初始化分词器
     text_model_path = get_text_model_path("google-bert/bert-base-uncased")
     tokenizer = AutoTokenizer.from_pretrained(text_model_path)
+
+    # 创建数据集和数据加载器
     ds = MultiModalDataset(data_dir=data_dir, samples=samples, image_transform=image_tf)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=2, collate_fn=lambda b: collate_fn(tokenizer, b, args.max_length))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # 加载模型
     model = MultiModalBaseline(ModelConfig()).to(device)
     state = torch.load(args.ckpt, map_location="cpu")
     model.load_state_dict(state["model"], strict=True)
