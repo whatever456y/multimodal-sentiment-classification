@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import random
+import re
 import time
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -21,8 +23,12 @@ from .models.baseline import ModelConfig, MultiModalBaseline
 from .utils import AverageMeter, count_parameters, ensure_dir, get_text_model_path, save_json, set_seed
 
 
-def collate_fn(tokenizer, batch, max_length: int):
+def collate_fn(tokenizer, batch, max_length: int, text_transform=None, train: bool = False):
+    # 数据批处理函数，整合文本编码和图像处理
     texts = [x["text"] for x in batch]
+    if text_transform is not None:
+        texts = [text_transform(t, train=train) for t in texts]
+
     images = torch.stack([x["image"] for x in batch])
     labels = torch.tensor([x["label"] for x in batch], dtype=torch.long)
 
@@ -42,8 +48,51 @@ def collate_fn(tokenizer, batch, max_length: int):
     }
 
 
+_url_pattern = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+_user_pattern = re.compile(r"@\w+")
+_multi_punct_pattern = re.compile(r"([!?]){2,}")
+
+
+def clean_text(text: str) -> str:
+    # 社交媒体文本清洗：标准化URL、用户提及和重复标点
+    text = _url_pattern.sub("<URL>", text)
+    text = _user_pattern.sub("<USER>", text)
+    text = _multi_punct_pattern.sub(r"\1", text)
+    return text.strip()
+
+
+def simple_augment(text: str) -> str:
+    # 轻量级文本增强：随机删除非关键token，避免破坏情感极性
+
+    tokens = text.split()
+    if len(tokens) <= 3:
+        return text
+    # 随机删除 1 个 token（概率较低）
+    if random.random() < 0.5:
+        idx = random.randint(0, len(tokens) - 1)
+        del tokens[idx]
+    return " ".join(tokens)
+
+
+def make_text_transform(config: str):
+    # 根据配置创建文本处理函数
+
+    def transform(text: str, train: bool = False) -> str:
+        if config in {"clean", "aug", "all"}:
+            text_out = clean_text(text)
+        else:
+            text_out = text
+
+        if config in {"aug", "all"} and train:
+            text_out = simple_augment(text_out)
+        return text_out
+
+    return transform
+
+
 @torch.no_grad()
 def evaluate(model, loader, device, criterion: nn.Module) -> Tuple[float, Dict[str, float]]:
+    # 模型评估函数
     model.eval()
     loss_meter = AverageMeter()
     all_y: List[int] = []
@@ -77,6 +126,7 @@ def evaluate(model, loader, device, criterion: nn.Module) -> Tuple[float, Dict[s
 
 
 def plot_loss_curve(train_losses: List[float], val_losses: List[float], save_path: Path) -> None:
+    # 绘制训练-验证损失曲线
     fig = plt.figure(figsize=(7, 5))
     plt.plot(train_losses, label="train")
     plt.plot(val_losses, label="val")
@@ -90,6 +140,7 @@ def plot_loss_curve(train_losses: List[float], val_losses: List[float], save_pat
 
 
 def plot_confusion_matrix(cm: np.ndarray, labels: List[str], save_path: Path) -> None:
+    # 绘制混淆矩阵
     fig = plt.figure(figsize=(6, 5))
     plt.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
     plt.title("Confusion Matrix")
@@ -119,6 +170,7 @@ def plot_confusion_matrix(cm: np.ndarray, labels: List[str], save_path: Path) ->
 
 @torch.no_grad()
 def predict_on_loader(model, loader, device) -> Tuple[List[int], List[int]]:
+    # 批量预测获取真实标签和预测标签
     model.eval()
     all_y: List[int] = []
     all_pred: List[int] = []
@@ -159,6 +211,34 @@ def main() -> None:
         choices=["concat", "weighted_sum", "gated", "attention", "bilinear"],
         help="Fusion strategy for text and image features.",
     )
+    parser.add_argument(
+        "--image_backbone",
+        type=str,
+        default="resnet50",
+        choices=["resnet50", "densenet121"],
+        help="Backbone for image encoder.",
+    )
+    parser.add_argument(
+        "--image_aug",
+        type=str,
+        default="base",
+        choices=["base", "light", "strong"],
+        help="Image augmentation config for training images.",
+    )
+    parser.add_argument(
+        "--text_config",
+        type=str,
+        default="base",
+        choices=["base", "clean", "aug", "twitter", "all"],
+        help="Text configuration: preprocessing / augmentation / encoder choice.",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="multimodal",
+        choices=["multimodal", "text_only", "image_only"],
+        help="Training mode: multimodal / text_only / image_only.",
+    )
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -198,13 +278,48 @@ def main() -> None:
     train_samples = [Sample(guid=g, label=y) for g, y in zip(train_guids, train_y)]
     val_samples = [Sample(guid=g, label=y) for g, y in zip(val_guids, val_y)]
 
-    image_tf_train = transforms.Compose(
-        [
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
+    # 图像增强：根据 image_aug 选择不同强度的训练增强策略
+    if args.mode == "text_only":
+        # 文本单模态时仍保留一个固定的占位图像张量形状（不会被使用）
+        image_tf_train = transforms.Compose(
+            [
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
+    elif args.image_aug == "light":
+        # 轻度增强：随机裁剪+翻转+颜色抖动
+        image_tf_train = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
+    elif args.image_aug == "strong":
+        # 强增强：更大范围的扰动
+        image_tf_train = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
+    else:
+        # base：仅做基础预处理，不进行随机增强
+        image_tf_train = transforms.Compose(
+            [
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
+    # 验证集始终使用基础预处理，保持可比性
     image_tf_val = transforms.Compose(
         [
             transforms.Resize((224, 224)),
@@ -213,9 +328,22 @@ def main() -> None:
         ]
     )
 
-    text_model_path = get_text_model_path("google-bert/bert-base-uncased")
+    # 选择文本编码模型：仅 twitter/all 使用 Twitter 专用模型，其余配置使用基线 BERT
+    if args.mode == "image_only":
+        # 图像单模态时仍需要一个 tokenizer 来生成占位 input_ids
+        text_model_name = "google-bert/bert-base-uncased"
+    else:
+        if args.text_config in {"twitter", "all"}:
+            text_model_name = "cardiffnlp/twitter-roberta-base-sentiment-latest"
+        else:
+            text_model_name = "google-bert/bert-base-uncased"
+
+    text_model_path = get_text_model_path(text_model_name)
     tokenizer = AutoTokenizer.from_pretrained(text_model_path)
 
+    text_transform = make_text_transform(args.text_config)
+
+    # ========== 创建数据集和数据加载器 ==========
     ds_train = MultiModalDataset(data_dir=data_dir, samples=train_samples, image_transform=image_tf_train)
     ds_val = MultiModalDataset(data_dir=data_dir, samples=val_samples, image_transform=image_tf_val)
 
@@ -224,22 +352,28 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        collate_fn=lambda b: collate_fn(tokenizer, b, args.max_length),
+        collate_fn=lambda b: collate_fn(tokenizer, b, args.max_length, text_transform=text_transform, train=True),
     )
     dl_val = DataLoader(
         ds_val,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        collate_fn=lambda b: collate_fn(tokenizer, b, args.max_length),
+        collate_fn=lambda b: collate_fn(tokenizer, b, args.max_length, text_transform=text_transform, train=False),
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_cfg = ModelConfig(fusion_type=args.fusion)
+    model_cfg = ModelConfig(
+        fusion_type=args.fusion,
+        text_model_name=text_model_name,
+        image_backbone=args.image_backbone,
+        mode=args.mode,
+    )
     model = MultiModalBaseline(model_cfg).to(device)
 
+    # ========== 参数冻结策略（迁移学习） ==========
     text_encoder = getattr(model, "text_encoder", None)
-    if text_encoder is not None:
+    if text_encoder is not None and args.mode != "image_only":
         embeddings = getattr(text_encoder, "embeddings", None)
         if embeddings is not None:
             for p in embeddings.parameters():
@@ -253,7 +387,7 @@ def main() -> None:
                     p.requires_grad = False
 
     image_encoder = getattr(model, "image_encoder", None)
-    if image_encoder is not None:
+    if image_encoder is not None and args.mode != "text_only":
         for name in ["conv1", "bn1", "layer1", "layer2", "layer3"]:
             module = getattr(image_encoder, name, None)
             if module is not None:
@@ -266,13 +400,14 @@ def main() -> None:
         out_dir / "model_params.json",
     )
 
+    # ========== 损失函数和优化器配置 ==========
     criterion = nn.CrossEntropyLoss()
 
     resnet_group_params: List[torch.nn.Parameter] = []
-    if image_encoder is not None:
+    if image_encoder is not None and args.mode != "text_only":
         if hasattr(image_encoder, "layer4"):
             resnet_group_params.extend(list(image_encoder.layer4.parameters()))
-    if hasattr(model, "image_proj"):
+    if hasattr(model, "image_proj") and args.mode != "text_only":
         resnet_group_params.extend(list(model.image_proj.parameters()))
 
     resnet_param_ids = {id(p) for p in resnet_group_params}
@@ -354,6 +489,7 @@ def main() -> None:
         if no_improve_epochs >= args.early_stop_patience:
             break
 
+    # ========== 训练后处理 ==========
     plot_loss_curve(train_losses, val_losses, plot_dir / "loss_curve.png")
 
     best_state = torch.load(ckpt_dir / "best.pt", map_location="cpu")
