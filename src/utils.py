@@ -10,6 +10,7 @@ import torch
 
 
 def set_seed(seed: int) -> None:
+    # 设置所有随机数生成器的种子以确保实验可复现
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -25,12 +26,14 @@ def ensure_dir(path: str | Path) -> Path:
 
 
 def count_parameters(model: torch.nn.Module) -> Tuple[int, int]:
+    # 统计模型参数量
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
 
 
 def save_json(obj: Dict[str, Any], path: str | Path) -> None:
+    # 将Python字典保存为JSON文件
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -39,6 +42,7 @@ def save_json(obj: Dict[str, Any], path: str | Path) -> None:
 
 @dataclass
 class AverageMeter:
+    # 用于跟踪和计算平均值
     total: float = 0.0
     count: int = 0
 
@@ -54,6 +58,7 @@ class AverageMeter:
 
 
 def get_text_model_path(default_name: str) -> str:
+    # 获取文本模型的本地路径，支持ModelScope和HuggingFace
     disable_modelscope = os.environ.get("DISABLE_MODELSCOPE", "0") == "1"
     if disable_modelscope:
         return default_name
